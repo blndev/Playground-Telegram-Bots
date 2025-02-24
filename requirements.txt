@@ -1,5 +1,6 @@
 # Core bot functionality
 python-telegram-bot  # Framework for building Telegram bots with async/await syntax
+python-telegram-bot[job-queue] # enable job queue extension for channel bot (scheduled tasks)
 
 # Environment configuration
 python-dotenv  # Load environment variables from .env files
