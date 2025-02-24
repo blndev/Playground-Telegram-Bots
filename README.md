@@ -85,6 +85,7 @@ An image processing bot that applies filters and moderates content. This POC dem
 
 3. **User Interface**
    - Friendly welcome message with usage instructions
+   - Interactive help system (type 'help' or use /help)
    - Clear feedback on all operations
    - Simple to use - just send an image
    - /clear command to remove chat history
@@ -93,6 +94,13 @@ An image processing bot that applies filters and moderates content. This POC dem
    - Clear entire chat history with a single command
    - Removes all messages and images
    - Provides feedback on clearing operation
+
+5. **Interactive Features**
+   - Responds to natural language help requests
+   - Provides processing status updates
+   - Friendly goodbye messages
+   - Helpful suggestions for next actions
+   - Real-time feedback during image processing
 
 ### Usage
 
