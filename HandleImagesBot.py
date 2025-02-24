@@ -4,6 +4,7 @@
 
 import logging
 import os
+import asyncio
 from io import BytesIO
 import random
 from PIL import Image
@@ -71,6 +72,16 @@ def dummy_nsfw_check(image: Image.Image) -> bool:
     """
     return random.random() < 0.1  # 10% chance of being flagged
 
+def is_private_chat(update: Update) -> bool:
+    """
+    Check if the message is from a private chat.
+    Args:
+        update (Update): Telegram update object
+    Returns:
+        bool: True if private chat, False otherwise
+    """
+    return update.effective_chat.type == "private"
+
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle /help command.
@@ -78,6 +89,10 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
+    # Only respond to help in private chats
+    if not is_private_chat(update):
+        return
+
     help_message = (
         "🔍 Available Commands:\n\n"
         "/start - Start the bot and see welcome message\n"
@@ -101,6 +116,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
+    # Only respond to text messages in private chats
+    if not is_private_chat(update):
+        return
+
     text = update.message.text.lower()
     
     if 'bye' in text or 'goodbye' in text:
@@ -123,6 +142,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
+    # Only respond to /start in private chats
+    if not is_private_chat(update):
+        return
+
     welcome_message = (
         "👋 Welcome to the Image Processing Bot!\n\n"
         "I can help you with images in the following ways:\n"
@@ -144,6 +167,10 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
+    # Only allow clearing in private chats
+    if not is_private_chat(update):
+        return
+
     try:
         # Get the message ID of the /clear command
         current_message_id = update.message.message_id
@@ -178,13 +205,18 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
+    # Skip processing for non-private chats
+    if not is_private_chat(update):
+        return
+
     # Send immediate feedback
-    processing_msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="🔄 Processing your image... This usually takes a few seconds."
-    )
-    
+    processing_msg = None
     try:
+        processing_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🔄 Processing your image... Please wait about 5 seconds."
+        )
+        
         # Get the largest available photo
         photo = max(update.message.photo, key=lambda x: x.file_size)
         
@@ -201,11 +233,11 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 message_id=update.message.message_id
             )
-            # Delete processing message
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=processing_msg.message_id
-            )
+            if processing_msg:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=processing_msg.message_id
+                )
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text="⚠️ This image has been removed as it may contain inappropriate content."
@@ -215,16 +247,20 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Apply sepia filter
         sepia_image = make_sepia(image)
         
+        # Simulate processing time
+        await asyncio.sleep(5)
+        
         # Save processed image to bytes
         output = BytesIO()
         sepia_image.save(output, format='JPEG')
         output.seek(0)
         
         # Delete processing message
-        await context.bot.delete_message(
-            chat_id=update.effective_chat.id,
-            message_id=processing_msg.message_id
-        )
+        if processing_msg:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=processing_msg.message_id
+            )
         
         # Send processed image with enhanced caption
         await context.bot.send_photo(
@@ -235,14 +271,15 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logger.error(f"Error processing image: {e}")
-        # Delete processing message
-        try:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=processing_msg.message_id
-            )
-        except:
-            pass
+        # Delete processing message if it exists
+        if processing_msg:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=processing_msg.message_id
+                )
+            except:
+                pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Sorry, I couldn't process that image. Please try again with another image."
