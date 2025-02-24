@@ -6,6 +6,7 @@ python-dotenv  # Load environment variables from .env files
 
 # Network requests
 requests  # HTTP library for checking link status and accessibility
+aiohttp  # Async HTTP client/server for Python for non-blocking URL checks
 
 # Image processing
 Pillow  # Python Imaging Library for image manipulation and filters

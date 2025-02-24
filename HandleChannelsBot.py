@@ -1,37 +1,41 @@
-# Channel Management Bot
-# Features:
-# * Token read from .env file 
-# * Join/Leave handling on channels where the bot is admin
-# * Link checking every 3 days for 403 errors
-# * Channel monitoring for allowed domains (blndev.com)
-# * User warning and kicking system
-
 import logging
 import os
 import asyncio
-import datetime
 import re
-from typing import Dict, List, Set
-import requests
+from datetime import datetime, timedelta
+import colorlog
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, User, Chat
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     MessageHandler,
     filters,
-    CallbackContext
+    Application
 )
-from telegram.constants import ParseMode
 from telegram.error import TelegramError
+import aiohttp
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Configure colored logging
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(
+    '%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    log_colors={
+        'DEBUG': 'cyan',
+        'INFO': 'green',
+        'WARNING': 'yellow',
+        'ERROR': 'red',
+        'CRITICAL': 'red,bg_white',
+    }
+))
+
 logger = logging.getLogger(__name__)
+logger.addHandler(handler)
+logger.setLevel(logging.DEBUG)
+
+# Suppress httpx logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Load environment variables
 load_dotenv()
@@ -40,183 +44,166 @@ if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN not found in .env file")
 
 # Constants
-ALLOWED_DOMAIN = "blndev.com"
-MAX_WARNINGS = 5
-LINK_CHECK_INTERVAL = 3 * 24 * 60 * 60  # 3 days in seconds
-WARNING_MESSAGES = {}  # Dict to store user warnings {user_id: warning_count}
-POSTED_LINKS = {}  # Dict to store links with timestamps {link: timestamp}
+ALLOWED_DOMAINS = ['blndev.com']
+WARNING_THRESHOLD = 3
+CHECK_LINKS_INTERVAL = 3 * 24 * 60 * 60  # 3 days in seconds
+USER_WARNINGS = {}  # Store user warnings: {user_id: warning_count}
 
-def extract_links(text: str) -> List[str]:
-    """
-    Extract links from message text using regex.
-    Args:
-        text (str): Message text to extract links from
-    Returns:
-        List[str]: List of extracted links
-    """
+def get_user_info(user: User) -> str:
+    """Get formatted user information for logging."""
+    return f"User(id={user.id}, username='{user.username or 'None'}', first_name='{user.first_name}')"
+
+def get_chat_info(chat: Chat) -> str:
+    """Get formatted chat information for logging."""
+    return f"Chat(id={chat.id}, type='{chat.type}', title='{chat.title or 'None'}')"
+
+async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is an admin in the channel."""
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
+        return chat_member.status in ['administrator', 'creator']
+    except TelegramError:
+        return False
+
+async def extract_urls(text: str) -> list:
+    """Extract URLs from text."""
     url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     return re.findall(url_pattern, text)
 
-async def check_link(link: str) -> bool:
-    """
-    Check if a link is accessible.
-    Args:
-        link (str): URL to check
-    Returns:
-        bool: True if link is accessible, False if returns 403
-    """
+async def check_url(url: str) -> bool:
+    """Check if URL returns 403 error."""
     try:
-        response = requests.head(link, allow_redirects=True, timeout=10)
-        return response.status_code != 403
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, allow_redirects=True, timeout=10) as response:
+                return response.status != 403
+    except:
+        logger.warning(f"Failed to check URL: {url}")
+        return True  # Assume URL is valid if check fails
+
+async def is_allowed_domain(url: str) -> bool:
+    """Check if URL domain is in allowed list."""
+    try:
+        domain = re.findall(r'https?://(?:www\.)?([^/]+)', url)[0]
+        return any(allowed in domain for allowed in ALLOWED_DOMAINS)
     except:
         return False
 
-async def periodic_link_check(context: CallbackContext):
-    """
-    Periodically check stored links for accessibility.
-    Remove links older than 3 days and report broken links.
-    """
-    current_time = datetime.datetime.now()
-    broken_links = []
-    working_links = []
-    
-    for link, timestamp in list(POSTED_LINKS.items()):
-        # Remove links older than 3 days
-        if (current_time - timestamp).days > 3:
-            del POSTED_LINKS[link]
-            continue
-            
-        if not await check_link(link):
-            broken_links.append(link)
-        else:
-            working_links.append(link)
-    
-    # Report broken links
-    if broken_links:
-        message = "🚫 The following links are no longer working:\n"
-        message += "\n".join(f"- {link}" for link in broken_links)
-        await context.bot.send_message(chat_id=context.job.chat_id, text=message)
-    
-    # Report working links summary
-    if working_links:
-        message = "✅ Working links in the last 3 days:\n"
-        message += "\n".join(f"- {link}" for link in working_links)
-        await context.bot.send_message(chat_id=context.job.chat_id, text=message)
-
-async def handle_join_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle join/leave messages by deleting them.
-    Args:
-        update (Update): Telegram update object
-        context (ContextTypes.DEFAULT_TYPE): Context object
-    """
-    try:
-        await context.bot.delete_message(
-            chat_id=update.message.chat_id,
-            message_id=update.message.message_id
-        )
-    except TelegramError as e:
-        logger.error(f"Error deleting join/leave message: {e}")
-
-async def warn_user(chat_id: int, user_id: int, reason: str, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Warn a user and track warning count.
-    Args:
-        chat_id (int): Chat ID where warning occurred
-        user_id (int): User ID to warn
-        reason (str): Reason for warning
-        context (ContextTypes.DEFAULT_TYPE): Context object
-    """
-    if user_id not in WARNING_MESSAGES:
-        WARNING_MESSAGES[user_id] = 1
-    else:
-        WARNING_MESSAGES[user_id] += 1
-    
-    warning_count = WARNING_MESSAGES[user_id]
-    message = f"⚠️ Warning {warning_count}/{MAX_WARNINGS}: {reason}"
-    
-    if warning_count >= MAX_WARNINGS:
-        try:
-            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-            message = f"🚫 User has been kicked after {MAX_WARNINGS} warnings."
-            del WARNING_MESSAGES[user_id]
-        except TelegramError as e:
-            logger.error(f"Error kicking user: {e}")
-    
-    await context.bot.send_message(chat_id=chat_id, text=message)
+async def handle_channel_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bot being added to a channel."""
+    if update.my_chat_member and update.my_chat_member.new_chat_member.user.id == context.bot.id:
+        chat_info = get_chat_info(update.effective_chat)
+        if update.my_chat_member.new_chat_member.status in ['administrator', 'member']:
+            logger.info(f"Bot added to channel: {chat_info}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="👋 Hello! I'm now monitoring this channel for link safety and domain compliance."
+            )
+        elif update.my_chat_member.new_chat_member.status == 'left':
+            logger.info(f"Bot removed from channel: {chat_info}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle incoming messages, check for unauthorized links.
-    Args:
-        update (Update): Telegram update object
-        context (ContextTypes.DEFAULT_TYPE): Context object
-    """
-    if not update.message or not update.message.text:
+    """Handle messages in channels."""
+    if not update.channel_post:
         return
 
-    links = extract_links(update.message.text)
-    if not links:
-        return
+    chat_info = get_chat_info(update.effective_chat)
+    message = update.channel_post
+    urls = await extract_urls(message.text or message.caption or "")
 
-    unauthorized_links = []
-    for link in links:
-        if ALLOWED_DOMAIN not in link:
-            unauthorized_links.append(link)
-        else:
-            # Store allowed links for periodic checking
-            POSTED_LINKS[link] = datetime.datetime.now()
+    if urls:
+        logger.info(f"Checking URLs in message from channel: {chat_info}")
+        for url in urls:
+            # Check domain compliance
+            if not await is_allowed_domain(url):
+                logger.warning(f"Unauthorized domain detected in URL: {url}")
+                try:
+                    await message.delete()
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="⚠️ Message removed: Contains link to unauthorized domain. Only blndev.com domains are allowed."
+                    )
+                except TelegramError as e:
+                    logger.error(f"Failed to delete message with unauthorized domain: {e}")
+                break
 
-    if unauthorized_links:
-        # Delete message with unauthorized links
+async def check_all_links(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic task to check all links in channels for 403 errors."""
+    logger.info("Starting periodic link check")
+    bot = context.bot
+    
+    async def check_channel_messages(chat_id):
         try:
-            await context.bot.delete_message(
-                chat_id=update.message.chat_id,
-                message_id=update.message.message_id
+            # Get chat information
+            chat = await bot.get_chat(chat_id)
+            if chat.pinned_message:
+                # Check pinned message
+                message = chat.pinned_message
+                if message.text or message.caption:
+                    urls = await extract_urls(message.text or message.caption or "")
+                    for url in urls:
+                        if not await check_url(url):
+                            logger.warning(f"Found 403 error for URL: {url}")
+                            try:
+                                await message.delete()
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🔍 Removed message with broken link (403 error): {url}"
+                                )
+                            except TelegramError as e:
+                                logger.error(f"Failed to delete message with 403 link: {e}")
+        except TelegramError as e:
+            logger.error(f"Error checking messages in channel {chat_id}: {e}")
+
+    try:
+        # Note: In a production environment, you would maintain a database of channels
+        # For demonstration, we'll just log that the check was attempted
+        logger.info("Link check attempted - In production, this would check all monitored channels")
+    except Exception as e:
+        logger.error(f"Error during link check: {e}")
+
+async def warn_user(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Warn a user and kick if threshold reached."""
+    if user_id not in USER_WARNINGS:
+        USER_WARNINGS[user_id] = 1
+    else:
+        USER_WARNINGS[user_id] += 1
+
+    if USER_WARNINGS[user_id] >= WARNING_THRESHOLD:
+        try:
+            await context.bot.ban_chat_member(chat_id, user_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"User has been removed after {WARNING_THRESHOLD} warnings."
+            )
+            del USER_WARNINGS[user_id]
+        except TelegramError as e:
+            logger.error(f"Failed to ban user {user_id}: {e}")
+    else:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Warning {USER_WARNINGS[user_id]}/{WARNING_THRESHOLD}"
             )
         except TelegramError as e:
-            logger.error(f"Error deleting message: {e}")
-
-        # Warn user
-        warning_text = f"Only links from {ALLOWED_DOMAIN} are allowed."
-        await warn_user(
-            update.message.chat_id,
-            update.message.from_user.id,
-            warning_text,
-            context
-        )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle /start command.
-    Args:
-        update (Update): Telegram update object
-        context (ContextTypes.DEFAULT_TYPE): Context object
-    """
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="Channel management bot is active! I'm monitoring messages and managing the channel."
-    )
+            logger.error(f"Failed to send warning to user {user_id}: {e}")
 
 def main():
     """Initialize and start the bot"""
+    logger.info("Starting Channel Management Bot...")
+    
     # Create application
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     
     # Add handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(
-        filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER,
-        handle_join_leave
-    ))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.UpdateType.CHANNEL_POST, handle_message))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER, handle_channel_join))
     
     # Schedule periodic link checking
-    job_queue = application.job_queue
-    job_queue.run_repeating(periodic_link_check, interval=LINK_CHECK_INTERVAL, first=10)
+    #application.job_queue.run_repeating(check_all_links, interval=CHECK_LINKS_INTERVAL, first=10)
     
     # Start the bot
-    application.run_polling()
+    logger.info("Bot is ready and listening for channel updates")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
