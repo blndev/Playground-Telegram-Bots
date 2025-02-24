@@ -7,9 +7,10 @@ import os
 import asyncio
 from io import BytesIO
 import random
+import colorlog
 from PIL import Image
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, User
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -19,14 +20,29 @@ from telegram.ext import (
     Application
 )
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Configure colored logging
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(
+    '%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    log_colors={
+        'DEBUG': 'cyan',
+        'INFO': 'green',
+        'WARNING': 'yellow',
+        'ERROR': 'red',
+        'CRITICAL': 'red,bg_white',
+    }
+))
+
+logger = logging.getLogger(__name__)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
 # Suppress httpx logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+
+def get_user_info(user: User) -> str:
+    """Get formatted user information for logging."""
+    return f"User(id={user.id}, username='{user.username or 'None'}', first_name='{user.first_name}')"
 
 # Load environment variables
 load_dotenv()
@@ -93,6 +109,9 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private_chat(update):
         return
 
+    user_info = get_user_info(update.effective_user)
+    logger.info(f"Help command received from {user_info}")
+
     help_message = (
         "🔍 Available Commands:\n\n"
         "/start - Start the bot and see welcome message\n"
@@ -121,8 +140,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.lower()
+    user_info = get_user_info(update.effective_user)
+    logger.info(f"Received message from {user_info}: {text}")
     
     if 'bye' in text or 'goodbye' in text:
+        logger.info(f"Sending goodbye message to {user_info}")
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="👋 Goodbye! Feel free to come back anytime. Your images will be waiting!"
@@ -145,6 +167,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Only respond to /start in private chats
     if not is_private_chat(update):
         return
+
+    user_info = get_user_info(update.effective_user)
+    logger.info(f"Start command received from {user_info}")
 
     welcome_message = (
         "👋 Welcome to the Image Processing Bot!\n\n"
@@ -170,6 +195,9 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Only allow clearing in private chats
     if not is_private_chat(update):
         return
+
+    user_info = get_user_info(update.effective_user)
+    logger.info(f"Clear command received from {user_info}")
 
     try:
         # Get the message ID of the /clear command
@@ -209,6 +237,9 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private_chat(update):
         return
 
+    user_info = get_user_info(update.effective_user)
+    logger.info(f"Processing image from {user_info}")
+
     # Send immediate feedback
     processing_msg = None
     try:
@@ -228,27 +259,36 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image = Image.open(BytesIO(image_bytes))
         
         # Check for NSFW content
+        logger.info(f"Checking image content for {user_info}")
         if dummy_nsfw_check(image):
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=update.message.message_id
-            )
-            if processing_msg:
+            logger.warning(f"NSFW content detected in image from {user_info} - removing message")
+            try:
                 await context.bot.delete_message(
                     chat_id=update.effective_chat.id,
-                    message_id=processing_msg.message_id
+                    message_id=update.message.message_id
                 )
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ This image has been removed as it may contain inappropriate content."
-            )
+                if processing_msg:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=processing_msg.message_id
+                    )
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="⚠️ This image has been removed as it may contain inappropriate content."
+                )
+                logger.info(f"Successfully removed NSFW image from {user_info}")
+            except Exception as e:
+                logger.error(f"Failed to remove NSFW image from {user_info}: {e}")
             return
+        logger.info(f"Content check passed for {user_info}")
         
         # Apply sepia filter
+        logger.info(f"Applying sepia filter for {user_info}")
         sepia_image = make_sepia(image)
         
         # Simulate processing time
         await asyncio.sleep(5)
+        logger.info(f"Image processing completed for {user_info}")
         
         # Save processed image to bytes
         output = BytesIO()
@@ -263,6 +303,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         # Send processed image with enhanced caption
+        logger.info(f"Sending processed image back to {user_info}")
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=output,
@@ -287,6 +328,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Initialize and start the bot"""
+    logger.info("Starting Image Processing Bot...")
+    
     # Create application
     application = ApplicationBuilder().token(TOKEN).build()
     
@@ -298,6 +341,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     # Start the bot
+    logger.info("Bot is ready and listening for messages")
     application.run_polling()
 
 if __name__ == '__main__':

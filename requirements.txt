@@ -9,3 +9,6 @@ requests  # HTTP library for checking link status and accessibility
 
 # Image processing
 Pillow  # Python Imaging Library for image manipulation and filters
+
+# Logging
+colorlog  # Colored formatting for logging output
