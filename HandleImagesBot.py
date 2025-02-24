@@ -10,6 +10,7 @@ import random
 import colorlog
 from PIL import Image
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 from telegram import Update, User, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,7 +19,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
     Application,
-    CallbackQueryHandler
+    CallbackQueryHandler,
+    TypeHandler
 )
 
 # Configure colored logging
@@ -134,8 +136,6 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         text=help_message
     )
-
-from datetime import datetime, timezone
 
 async def check_message_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
@@ -408,12 +408,51 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Error handling callback query: {e}", exc_info=True)
 
+async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Debug handler to log all updates received by the bot.
+    Args:
+        update (Update): Telegram update object
+        context (ContextTypes.DEFAULT_TYPE): Context object
+    """
+    # Convert update to dict for better logging
+    update_dict = update.to_dict()
+    
+    # Get update type and details
+    update_type = "Unknown"
+    details = ""
+    
+    if update.message:
+        update_type = f"Message ({update.message.chat.type})"
+        if update.message.text:
+            details = f" - Text: {update.message.text[:50]}..."
+        elif update.message.photo:
+            details = f" - Photo (sizes: {len(update.message.photo)})"
+        elif update.message.document:
+            details = f" - Document ({update.message.document.file_name})"
+    elif update.edited_message:
+        update_type = "Edited Message"
+        if update.edited_message.text:
+            details = f" - Text: {update.edited_message.text[:50]}..."
+    elif update.callback_query:
+        update_type = "Callback Query"
+        details = f" - Data: {update.callback_query.data}"
+    elif update.message_reaction:
+        update_type = "Message Reaction"
+        details = f" - New: {update.message_reaction.new_reaction}, Old: {update.message_reaction.old_reaction}"
+    
+    logger.debug(f"Received {update_type}{details}")
+    logger.debug(f"Full update: {update_dict}")
+
 def main():
     """Initialize and start the bot"""
     logger.info("Starting Image Processing Bot...")
     
     # Create application
     application = ApplicationBuilder().token(TOKEN).build()
+    
+    # Add debug handler first to log all updates (using TypeHandler for ALL updates)
+    application.add_handler(TypeHandler(Update, debug_handler), group=-1)
     
     # Add handlers in specific order
     application.add_handler(CommandHandler('start', start))
@@ -432,10 +471,6 @@ def main():
     
     # Start the bot
     logger.info("Bot is ready and listening for messages")
-    # application.run_polling(
-    #     allowed_updates=["message", "edited_message", "callback_query"],
-    #     drop_pending_updates=False
-    # )
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False
