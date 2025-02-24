@@ -1,3 +1,4 @@
+
 # * gives a short introduction on start
 # * receive images, post images (use make sepia)
 # * scan for NSFW (dummy instead onnx) and remove with a message
@@ -10,14 +11,15 @@ import random
 import colorlog
 from PIL import Image
 from dotenv import load_dotenv
-from telegram import Update, User, Message
+from telegram import Update, User, Message, MessageReactionUpdated
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     MessageHandler,
     filters,
-    Application
+    Application,
+    TypeHandler
 )
 
 # Configure colored logging
@@ -39,6 +41,11 @@ logger.setLevel(logging.DEBUG)
 
 # Suppress httpx logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Define reaction emojis
+THUMBS_UP = "👍"
+HEART = "❤️"
+THUMBS_DOWN = "👎"
 
 def get_user_info(user: User) -> str:
     """Get formatted user information for logging."""
@@ -121,14 +128,42 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Send any image to apply sepia filter\n"
         "- Images are automatically checked for inappropriate content\n"
         "- Processing usually takes a few seconds\n"
-        "- React with 👍 or ❤️ if you like the result\n"
-        "- Use 👎 if you want to give feedback for improvement\n\n"
+        "- Use message reactions to give feedback\n"
+        f"- {THUMBS_UP} or {HEART} if you like something\n"
+        f"- {THUMBS_DOWN} if you want to give feedback\n"
+        "- You can react to both images and messages!\n\n"
         "Need more help? Just ask! 😊"
     )
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=help_message
     )
+
+from datetime import datetime, timezone
+
+async def check_message_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Check if message is older than 10 minutes and send apology if needed.
+    Args:
+        update (Update): Telegram update object
+        context (ContextTypes.DEFAULT_TYPE): Context object
+    Returns:
+        bool: True if apology was sent (message is old), False otherwise
+    """
+    if not update.message:
+        return False
+        
+    message_time = update.message.date
+    current_time = datetime.now(timezone.utc)
+    time_diff = (current_time - message_time).total_seconds()
+    
+    if time_diff > 600:  # 10 minutes = 600 seconds
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="I apologize for the delay in responding, I was offline. Let me help you now..."
+        )
+        return True
+    return False
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -141,13 +176,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private_chat(update):
         return
 
-    # Skip if this is a reaction to a photo
-    if update.message.reply_to_message and update.message.reply_to_message.photo:
-        return
-
     text = update.message.text.lower()
     user_info = get_user_info(update.effective_user)
     logger.info(f"Received message from {user_info}: {text}")
+    
+    # Check message age and send apology if needed
+    is_old_message = await check_message_age(update, context)
     
     if 'bye' in text or 'goodbye' in text:
         logger.info(f"Sending goodbye message to {user_info}")
@@ -245,6 +279,9 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_info = get_user_info(update.effective_user)
     logger.info(f"Processing image from {user_info}")
+    
+    # Check message age and send apology if needed
+    is_old_message = await check_message_age(update, context)
 
     # Send immediate feedback
     processing_msg = None
@@ -314,8 +351,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             photo=output,
             caption="🎨 Here's your image with a sepia filter!\n\n"
-                    "Like the result? React with 👍 or ❤️\n"
-                    "Want to give feedback? React with 👎\n\n"
+                    f"Like the result? React with {THUMBS_UP} or {HEART}\n"
+                    f"Want to give feedback? React with {THUMBS_DOWN}\n\n"
                     "Want to process another image? Just send it to me! 📸"
         )
         
@@ -335,96 +372,76 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Sorry, I couldn't process that image. Please try again with another image."
         )
 
-async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_reaction_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle reactions to bot-generated images.
+    Handle message reaction updates.
     Args:
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
-    user_info = get_user_info(update.effective_user)
-    logger.debug(f"Reaction handler triggered by {user_info}")
-
-    # Only handle reactions in private chats
-    if not is_private_chat(update):
-        logger.debug(f"Skipping reaction: not a private chat (type: {update.effective_chat.type})")
-        return
-
-    # Check if this is a reply to a message
-    if not update.message:
-        logger.debug("Skipping reaction: no message object")
-        return
+    logger.debug(f"Raw update received: {update.to_dict()}")
     
-    if not update.message.reply_to_message:
-        logger.debug("Skipping reaction: not a reply to any message")
+    # Check if this is a reaction update
+    if not hasattr(update, 'message_reaction'):
+        logger.debug("Not a reaction update")
         return
-
-    # Check if the reaction is to a bot-generated image
-    replied_msg = update.message.reply_to_message
-    if not replied_msg.from_user:
-        logger.debug("Skipping reaction: replied message has no user")
-        return
-    
-    if replied_msg.from_user.id != context.bot.id:
-        logger.debug(f"Skipping reaction: replied message not from bot (from user {replied_msg.from_user.id})")
-        return
-    
-    # Only handle reactions to photos
-    if not replied_msg.photo:
-        logger.debug("Skipping reaction: replied message is not a photo")
-        return
-
-    reaction = update.message.text
-    logger.debug(f"Processing reaction '{reaction}' from {user_info}")
-
+        
     try:
-        if '👍' in reaction or '❤️' in reaction:
-            logger.info(f"Received positive reaction from {user_info}")
+        # Extract reaction information from raw update
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        reaction_data = update.to_dict().get('message_reaction', {})
+        
+        logger.debug(f"Processing reaction from user {user.id} in chat {chat_id}")
+        logger.debug(f"Reaction data: {reaction_data}")
+        
+        # Get the new reaction emoji if available
+        new_reaction = reaction_data.get('new_reaction', [])
+        if not new_reaction:
+            logger.debug("No new reaction found")
+            return
+            
+        # Process the reaction
+        reaction_emoji = new_reaction[0] if isinstance(new_reaction, list) else new_reaction
+        logger.info(f"Received reaction: {reaction_emoji}")
+        
+        if reaction_emoji in [THUMBS_UP, HEART]:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Thank you! I'm glad you liked the result! 😊"
+                chat_id=chat_id,
+                text="Thank you for your positive feedback! 😊"
             )
-            logger.debug("Sent positive reaction response")
-        elif '👎' in reaction:
-            logger.warning(f"Received negative reaction from {user_info}")
+        elif reaction_emoji == THUMBS_DOWN:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="I'm sorry you didn't like it. Could you tell me what you didn't like? "
+                chat_id=chat_id,
+                text="I appreciate your feedback. Could you tell me what you didn't like? "
                 "This helps me understand how to improve! 🤔"
             )
-            logger.debug("Sent negative reaction response")
         else:
-            logger.debug(f"Unhandled reaction type: {reaction}")
+            logger.debug(f"Unhandled reaction: {reaction_emoji}")
+            
     except Exception as e:
-        logger.error(f"Error handling reaction: {e}")
+        logger.error(f"Error handling reaction update: {e}", exc_info=True)
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 
 def main():
     """Initialize and start the bot"""
     logger.info("Starting Image Processing Bot...")
-    
+
     # Create application
     application = ApplicationBuilder().token(TOKEN).build()
-    
+    application
     # Add handlers in specific order
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help))
     application.add_handler(CommandHandler('clear', clear))
     application.add_handler(MessageHandler(filters.PHOTO, handle_image))
     
-    # Handle reactions before general text messages
-    # reaction_handler = MessageHandler(
-    #     filters.TEXT & filters.REPLY & filters.Regex('(👍|👎|❤️)'),
-    #     handle_reaction,
-    #     block=True  # Ensure reaction handling completes before other handlers
-    # )
-    reaction_handler = MessageHandler(
-        filters.TEXT & filters.REPLY,
-        handle_reaction,
-        block=True  # Ensure reaction handling completes before other handlers
-    )
-    application.add_handler(reaction_handler)
+    # Handle message reactions
+    application.add_handler(TypeHandler(MessageReactionUpdated, handle_reaction_update))
     
-    # Handle all other text messages
+    # Handle text messages
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_text
@@ -432,7 +449,10 @@ def main():
     
     # Start the bot
     logger.info("Bot is ready and listening for messages")
-    application.run_polling()
-
+    # Start polling with reaction updates enabled
+    application.run_polling(
+        allowed_updates=["message", "edited_message", "message_reaction", "callback_query"],
+        drop_pending_updates=True
+    )
 if __name__ == '__main__':
     main()
