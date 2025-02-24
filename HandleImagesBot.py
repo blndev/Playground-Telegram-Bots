@@ -1,4 +1,3 @@
-
 # * gives a short introduction on start
 # * receive images, post images (use make sepia)
 # * scan for NSFW (dummy instead onnx) and remove with a message
@@ -11,7 +10,7 @@ import random
 import colorlog
 from PIL import Image
 from dotenv import load_dotenv
-from telegram import Update, User, Message, MessageReactionUpdated
+from telegram import Update, User, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -19,7 +18,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
     Application,
-    TypeHandler
+    CallbackQueryHandler
 )
 
 # Configure colored logging
@@ -42,10 +41,9 @@ logger.setLevel(logging.DEBUG)
 # Suppress httpx logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Define reaction emojis
-THUMBS_UP = "👍"
-HEART = "❤️"
-THUMBS_DOWN = "👎"
+# Define feedback buttons
+LIKE_CALLBACK = "like"
+DISLIKE_CALLBACK = "dislike"
 
 def get_user_info(user: User) -> str:
     """Get formatted user information for logging."""
@@ -128,10 +126,8 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Send any image to apply sepia filter\n"
         "- Images are automatically checked for inappropriate content\n"
         "- Processing usually takes a few seconds\n"
-        "- Use message reactions to give feedback\n"
-        f"- {THUMBS_UP} or {HEART} if you like something\n"
-        f"- {THUMBS_DOWN} if you want to give feedback\n"
-        "- You can react to both images and messages!\n\n"
+        "- Use the feedback buttons to let me know what you think!\n"
+        "- You can provide feedback on any processed image\n\n"
         "Need more help? Just ask! 😊"
     )
     await context.bot.send_message(
@@ -345,15 +341,23 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=processing_msg.message_id
             )
         
-        # Send processed image with enhanced caption
+        # Create inline keyboard
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👍 Like", callback_data=LIKE_CALLBACK),
+                InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
+            ]
+        ])
+
+        # Send processed image with inline keyboard
         logger.info(f"Sending processed image back to {user_info}")
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=output,
             caption="🎨 Here's your image with a sepia filter!\n\n"
-                    f"Like the result? React with {THUMBS_UP} or {HEART}\n"
-                    f"Want to give feedback? React with {THUMBS_DOWN}\n\n"
-                    "Want to process another image? Just send it to me! 📸"
+                    "Please provide your feedback using the buttons below.\n\n"
+                    "Want to process another image? Just send it to me! 📸",
+            reply_markup=keyboard
         )
         
     except Exception as e:
@@ -372,74 +376,53 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Sorry, I couldn't process that image. Please try again with another image."
         )
 
-async def handle_reaction_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle message reaction updates.
+    Handle callback queries from inline keyboard buttons.
     Args:
         update (Update): Telegram update object
         context (ContextTypes.DEFAULT_TYPE): Context object
     """
-    logger.debug(f"Raw update received: {update.to_dict()}")
+    query = update.callback_query
+    await query.answer()  # Answer the callback query to remove loading state
     
-    # Check if this is a reaction update
-    if not hasattr(update, 'message_reaction'):
-        logger.debug("Not a reaction update")
-        return
-        
+    user_info = get_user_info(query.from_user)
+    logger.info(f"Received feedback from {user_info}: {query.data}")
+    
     try:
-        # Extract reaction information from raw update
-        chat_id = update.effective_chat.id
-        user = update.effective_user
-        reaction_data = update.to_dict().get('message_reaction', {})
-        
-        logger.debug(f"Processing reaction from user {user.id} in chat {chat_id}")
-        logger.debug(f"Reaction data: {reaction_data}")
-        
-        # Get the new reaction emoji if available
-        new_reaction = reaction_data.get('new_reaction', [])
-        if not new_reaction:
-            logger.debug("No new reaction found")
-            return
-            
-        # Process the reaction
-        reaction_emoji = new_reaction[0] if isinstance(new_reaction, list) else new_reaction
-        logger.info(f"Received reaction: {reaction_emoji}")
-        
-        if reaction_emoji in [THUMBS_UP, HEART]:
+        if query.data == LIKE_CALLBACK:
             await context.bot.send_message(
-                chat_id=chat_id,
+                chat_id=query.message.chat_id,
                 text="Thank you for your positive feedback! 😊"
             )
-        elif reaction_emoji == THUMBS_DOWN:
+            # Remove the inline keyboard after feedback
+            await query.edit_message_reply_markup(reply_markup=None)
+        elif query.data == DISLIKE_CALLBACK:
             await context.bot.send_message(
-                chat_id=chat_id,
+                chat_id=query.message.chat_id,
                 text="I appreciate your feedback. Could you tell me what you didn't like? "
                 "This helps me understand how to improve! 🤔"
             )
-        else:
-            logger.debug(f"Unhandled reaction: {reaction_emoji}")
-            
+            # Remove the inline keyboard after feedback
+            await query.edit_message_reply_markup(reply_markup=None)
     except Exception as e:
-        logger.error(f"Error handling reaction update: {e}", exc_info=True)
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+        logger.error(f"Error handling callback query: {e}", exc_info=True)
 
 def main():
     """Initialize and start the bot"""
     logger.info("Starting Image Processing Bot...")
-
+    
     # Create application
     application = ApplicationBuilder().token(TOKEN).build()
-    application
+    
     # Add handlers in specific order
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help))
     application.add_handler(CommandHandler('clear', clear))
     application.add_handler(MessageHandler(filters.PHOTO, handle_image))
     
-    # Handle message reactions
-    application.add_handler(TypeHandler(MessageReactionUpdated, handle_reaction_update))
+    # Handle callback queries from inline keyboard
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
     
     # Handle text messages
     application.add_handler(MessageHandler(
@@ -449,10 +432,13 @@ def main():
     
     # Start the bot
     logger.info("Bot is ready and listening for messages")
-    # Start polling with reaction updates enabled
+    # application.run_polling(
+    #     allowed_updates=["message", "edited_message", "callback_query"],
+    #     drop_pending_updates=False
+    # )
     application.run_polling(
-        allowed_updates=["message", "edited_message", "message_reaction", "callback_query"],
-        drop_pending_updates=True
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False
     )
 if __name__ == '__main__':
     main()
