@@ -10,7 +10,7 @@ import random
 import colorlog
 from PIL import Image
 from dotenv import load_dotenv
-from telegram import Update, User
+from telegram import Update, User, Message
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -35,7 +35,7 @@ handler.setFormatter(colorlog.ColoredFormatter(
 
 logger = logging.getLogger(__name__)
 logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # Suppress httpx logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -120,7 +120,9 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 Image Processing:\n"
         "- Send any image to apply sepia filter\n"
         "- Images are automatically checked for inappropriate content\n"
-        "- Processing usually takes a few seconds\n\n"
+        "- Processing usually takes a few seconds\n"
+        "- React with 👍 or ❤️ if you like the result\n"
+        "- Use 👎 if you want to give feedback for improvement\n\n"
         "Need more help? Just ask! 😊"
     )
     await context.bot.send_message(
@@ -137,6 +139,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     # Only respond to text messages in private chats
     if not is_private_chat(update):
+        return
+
+    # Skip if this is a reaction to a photo
+    if update.message.reply_to_message and update.message.reply_to_message.photo:
         return
 
     text = update.message.text.lower()
@@ -307,7 +313,10 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=output,
-            caption="🎨 Here's your image with a sepia filter!\nWant to process another image? Just send it to me! 📸"
+            caption="🎨 Here's your image with a sepia filter!\n\n"
+                    "Like the result? React with 👍 or ❤️\n"
+                    "Want to give feedback? React with 👎\n\n"
+                    "Want to process another image? Just send it to me! 📸"
         )
         
     except Exception as e:
@@ -326,6 +335,69 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Sorry, I couldn't process that image. Please try again with another image."
         )
 
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle reactions to bot-generated images.
+    Args:
+        update (Update): Telegram update object
+        context (ContextTypes.DEFAULT_TYPE): Context object
+    """
+    user_info = get_user_info(update.effective_user)
+    logger.debug(f"Reaction handler triggered by {user_info}")
+
+    # Only handle reactions in private chats
+    if not is_private_chat(update):
+        logger.debug(f"Skipping reaction: not a private chat (type: {update.effective_chat.type})")
+        return
+
+    # Check if this is a reply to a message
+    if not update.message:
+        logger.debug("Skipping reaction: no message object")
+        return
+    
+    if not update.message.reply_to_message:
+        logger.debug("Skipping reaction: not a reply to any message")
+        return
+
+    # Check if the reaction is to a bot-generated image
+    replied_msg = update.message.reply_to_message
+    if not replied_msg.from_user:
+        logger.debug("Skipping reaction: replied message has no user")
+        return
+    
+    if replied_msg.from_user.id != context.bot.id:
+        logger.debug(f"Skipping reaction: replied message not from bot (from user {replied_msg.from_user.id})")
+        return
+    
+    # Only handle reactions to photos
+    if not replied_msg.photo:
+        logger.debug("Skipping reaction: replied message is not a photo")
+        return
+
+    reaction = update.message.text
+    logger.debug(f"Processing reaction '{reaction}' from {user_info}")
+
+    try:
+        if '👍' in reaction or '❤️' in reaction:
+            logger.info(f"Received positive reaction from {user_info}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Thank you! I'm glad you liked the result! 😊"
+            )
+            logger.debug("Sent positive reaction response")
+        elif '👎' in reaction:
+            logger.warning(f"Received negative reaction from {user_info}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="I'm sorry you didn't like it. Could you tell me what you didn't like? "
+                "This helps me understand how to improve! 🤔"
+            )
+            logger.debug("Sent negative reaction response")
+        else:
+            logger.debug(f"Unhandled reaction type: {reaction}")
+    except Exception as e:
+        logger.error(f"Error handling reaction: {e}")
+
 def main():
     """Initialize and start the bot"""
     logger.info("Starting Image Processing Bot...")
@@ -333,12 +405,30 @@ def main():
     # Create application
     application = ApplicationBuilder().token(TOKEN).build()
     
-    # Add handlers
+    # Add handlers in specific order
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help))
     application.add_handler(CommandHandler('clear', clear))
     application.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Handle reactions before general text messages
+    # reaction_handler = MessageHandler(
+    #     filters.TEXT & filters.REPLY & filters.Regex('(👍|👎|❤️)'),
+    #     handle_reaction,
+    #     block=True  # Ensure reaction handling completes before other handlers
+    # )
+    reaction_handler = MessageHandler(
+        filters.TEXT & filters.REPLY,
+        handle_reaction,
+        block=True  # Ensure reaction handling completes before other handlers
+    )
+    application.add_handler(reaction_handler)
+    
+    # Handle all other text messages
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text
+    ))
     
     # Start the bot
     logger.info("Bot is ready and listening for messages")
