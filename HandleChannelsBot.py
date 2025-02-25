@@ -124,14 +124,50 @@ async def handle_chat_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Bot removed from {update.effective_chat.type}: {chat_info}")
             MONITORED_CHATS.discard(update.effective_chat.id)
 
+async def update_monitored_chats(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Update MONITORED_CHATS based on bot's status in the chat."""
+    logger.debug(f"Entering update_monitored_chats for chat_id: {chat_id}")
+    try:
+        # Get current monitoring status
+        was_monitored = chat_id in MONITORED_CHATS
+        bot = context.bot
+        bot_info = await bot.get_me()
+        # Check bot's status
+        member = await context.bot.get_chat_member(chat_id, user_id=bot_info.id)
+        logger.debug(f"Bot status in chat {chat_id}: {member.status}")
+        
+        if member.status in ['administrator', 'member']:
+            MONITORED_CHATS.add(chat_id)
+            if not was_monitored:
+                logger.info(f"Started monitoring chat {chat_id} (status: {member.status})")
+            else:
+                logger.debug(f"Continuing to monitor chat {chat_id} (status: {member.status})")
+        else:
+            if was_monitored:
+                logger.info(f"Stopped monitoring chat {chat_id} (status: {member.status})")
+            MONITORED_CHATS.discard(chat_id)
+            logger.debug(f"Chat {chat_id} not monitored (status: {member.status})")
+    except TelegramError as e:
+        if chat_id in MONITORED_CHATS:
+            logger.info(f"Stopped monitoring chat {chat_id} due to error")
+        logger.warning(f"Could not verify status in chat {chat_id}: {e}")
+        MONITORED_CHATS.discard(chat_id)
+    logger.debug(f"Exiting update_monitored_chats. Total monitored chats: {len(MONITORED_CHATS)}")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in channels and groups."""
+    chat_info = get_chat_info(update.effective_chat)
+    logger.debug(f"Entering handle_message for {chat_info}")
+    
     # Get the message object based on whether it's a channel post or regular message
     message = update.channel_post if update.channel_post else update.message
     if not message:
+        logger.debug("No message found in update, exiting handle_message")
         return
 
-    chat_info = get_chat_info(update.effective_chat)
+    # Update MONITORED_CHATS on every message
+    logger.debug(f"Updating monitored chats status for {chat_info}")
+    await update_monitored_chats(update.effective_chat.id, context)
     urls = await extract_urls(message.text or message.caption or "")
 
     if urls:
@@ -142,13 +178,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Unauthorized domain detected in URL: {url}")
                 try:
                     await message.delete()
-                    await context.bot.send_message(
+                    warning_msg = await context.bot.send_message(
                         chat_id=update.effective_chat.id,
                         text="⚠️ Message removed: Contains link to unauthorized domain. Only blndev.com domains are allowed."
                     )
                     # If it's a group message, warn the user
-                    if update.message and update.message.from_user:
-                        await warn_user(update.message.from_user.id, update.effective_chat.id, context)
+                    if message.from_user:
+                        await warn_user(message.from_user.id, update.effective_chat.id, context)
+                        # Delete warning message after 30 seconds in groups
+                        await asyncio.sleep(30)
+                        await warning_msg.delete()
                 except TelegramError as e:
                     logger.error(f"Failed to delete message with unauthorized domain: {e}")
                 break
@@ -162,7 +201,7 @@ async def check_all_links(context: ContextTypes.DEFAULT_TYPE):
         try:
             # Calculate the date threshold (7 days ago)
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=SCAN_MESSAGE_DAYS)
-            
+            logger.debug(f"Scan for old messages in ChatID: {chat_id}")
             try:
                 # Get chat information
                 chat = await context.bot.get_chat(chat_id)
@@ -206,6 +245,18 @@ async def check_all_links(context: ContextTypes.DEFAULT_TYPE):
                         if message.text or message.caption:
                             urls = await extract_urls(message.text or message.caption or "")
                             for url in urls:
+                                # First check domain compliance
+                                if not await is_allowed_domain(url):
+                                    logger.warning(f"Found unauthorized domain in URL: {url}")
+                                    try:
+                                        await message.delete()
+                                        if message.from_user:
+                                            await warn_user(message.from_user.id, chat_id, context)
+                                    except TelegramError as e:
+                                        logger.error(f"Failed to delete message with unauthorized domain: {e}")
+                                    continue
+
+                                # Then check for errors
                                 is_valid, error_message = await check_url(url)
                                 if not is_valid:
                                     logger.warning(f"Found error for URL: {url} - {error_message}")
@@ -271,15 +322,49 @@ async def warn_user(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TY
             logger.error(f"Failed to ban user {user_id}: {e}")
     else:
         try:
-            await context.bot.send_message(
+            warning_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"⚠️ Warning {USER_WARNINGS[user_id]}/{WARNING_THRESHOLD}"
             )
+            # Delete warning message after 30 seconds in groups
+            await asyncio.sleep(30)
+            await warning_msg.delete()
         except TelegramError as e:
             logger.error(f"Failed to send warning to user {user_id}: {e}")
 
+async def initialize_monitored_chats(application: Application):
+    """Initialize MONITORED_CHATS with all channels and groups where bot is member/admin."""
+    try:
+        # Get bot information
+        bot = application.bot
+        bot_info = await bot.get_me()
+        logger.info(f"Initializing monitored chats for bot: {bot_info.username}")
+
+        
+        # Get all updates to find initial chats
+        updates = await bot.get_updates(offset=-1, timeout=1)
+        initial_chats = set()
+        for update in updates:
+            if update.effective_chat:
+                initial_chats.add(update.effective_chat.id)
+
+        # Check bot's status in each chat
+        for chat_id in initial_chats:
+            try:
+                chat = await bot.get_chat(chat_id)
+                member = await bot.get_chat_member(chat_id)
+                if member.status in ['administrator', 'member']:
+                    MONITORED_CHATS.add(chat_id)
+                    logger.info(f"Added existing chat to monitoring: {get_chat_info(chat)}")
+            except TelegramError as e:
+                logger.warning(f"Could not verify status in chat {chat_id}: {e}")
+
+        logger.info(f"Initialized monitoring for {len(MONITORED_CHATS)} chats")
+    except Exception as e:
+        logger.error(f"Error initializing monitored chats: {e}")
+
 def main():
-    """Initialize and start the bot"""
+    """Start the bot with proper async handling"""
     logger.info("Starting Chat Management Bot...")
     
     # Create application
@@ -287,8 +372,8 @@ def main():
     
     # Add handlers for both channels and groups
     application.add_handler(MessageHandler(
-        (filters.ChatType.CHANNEL | filters.ChatType.GROUPS) & 
-        (filters.UpdateType.CHANNEL_POST | filters.UpdateType.MESSAGE), 
+        (filters.ChatType.CHANNEL | filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & 
+        (filters.TEXT | filters.CAPTION), 
         handle_message
     ))
     application.add_handler(MessageHandler(
@@ -299,7 +384,10 @@ def main():
     # Schedule periodic link checking
     application.job_queue.run_repeating(check_all_links, interval=CHECK_LINKS_INTERVAL, first=10)
     
-    # Start the bot
+    # Set up pre-run callback for initialization
+    application.post_init = initialize_monitored_chats
+    
+    # Run the bot
     logger.info("Bot is ready and listening for updates")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
