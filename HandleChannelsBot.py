@@ -17,7 +17,7 @@ from telegram import Update, User, Chat
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
-    CommandHandler,
+    CallbackContext,
     MessageHandler,
     filters,
     Application
@@ -54,13 +54,93 @@ if not TOKEN:
 # Constants
 ALLOWED_DOMAINS = ['blndev.com']
 WARNING_THRESHOLD = 3
-CHECK_LINKS_INTERVAL = 30 * 60  # 30 minutes in seconds
+CHECK_LINKS_INTERVAL = 60  # 30 minutes in seconds
 SCAN_MESSAGE_DAYS = 7  # Number of days of messages to scan
 USER_WARNINGS = {}  # Store user warnings: {user_id: warning_count}
 MONITORED_CHATS = set()  # Store channels and groups where bot is admin
 
 # Store active links for summary
 ACTIVE_LINKS = {}  # {chat_id: {url: title}}
+
+import pickle
+# In-memory storage for messages
+chat_messages = {}
+# File path for storing chat messages
+CHAT_MESSAGES_FILE = 'chat_messages.pkl'
+
+async def message_store_handler(update: Update, context: CallbackContext):
+    logger.debug(f"received update {update.to_json()} with context {context}")
+    # Store the message in the chat_messages dictionary
+    chat_id = None
+    message_id = None
+    user_id = None
+    message_text = None
+    timestamp = None
+
+    if update.channel_post:
+        print(f"Channel chat_id: {chat_id}")
+        chat_id = update.channel_post.chat_id
+        message_id = update.channel_post.message_id
+        user_id = None
+        message_text = update.channel_post.text
+        timestamp = update.channel_post.date
+
+    elif update.message:
+        chat_type = update.message.chat.type 
+        if chat_type == "private":
+            logger.warning(f"Private chat received from chat: {update.message.chat}, msg: {update.message.text}")
+            return
+        
+        chat_id = update.message.chat_id
+        message_id = update.message.message_id
+        user_id = update.message.from_user.id
+        message_text = update.message.text
+        timestamp = update.message.date
+        
+        chat_messages[chat_id].append({
+            'message_id': message_id,
+            'user_id': user_id,
+            'message_text': message_text,
+            'timestamp': timestamp
+        })
+    else:
+        logger.warning("no channel post or message. exit analyze function")
+
+    if chat_id not in chat_messages:
+        chat_messages[chat_id] = []
+
+    # Optionally, clean up old messages
+    clean_up_old_messages(chat_id)
+    dump_chat_messages_to_disk()
+    #TODO: now add scan logic from other handler
+
+def clean_up_old_messages(chat_id):
+    # Remove messages older than 7 days
+    #tz = datetime.now().astimezone().tzinfo
+    seven_days_ago = datetime.now().astimezone() - timedelta(days=7)
+    chat_messages[chat_id] = [
+        message for message in chat_messages[chat_id] if message['timestamp'] >= seven_days_ago
+    ]
+
+def get_all_chat_ids():
+    # Return a list of all chat IDs
+    return list(chat_messages.keys())
+
+def get_messages_last_7_days(chat_id):
+    # Return messages from the last 7 days for the specified chat
+    return chat_messages.get(chat_id, [])
+
+def dump_chat_messages_to_disk():
+    with open(CHAT_MESSAGES_FILE, 'wb') as f:
+        pickle.dump(chat_messages, f)
+    print("Chat messages dumped to disk.")
+
+def load_chat_messages_from_disk():
+    global chat_messages
+    if os.path.exists(CHAT_MESSAGES_FILE):
+        with open(CHAT_MESSAGES_FILE, 'rb') as f:
+            chat_messages = pickle.load(f)
+        print("Chat messages loaded from disk.")
 
 def get_user_info(user: User) -> str:
     """Get formatted user information for logging."""
@@ -70,15 +150,19 @@ def get_chat_info(chat: Chat) -> str:
     """Get formatted chat information for logging."""
     return f"Chat(id={chat.id}, type='{chat.type}', title='{chat.title or 'None'}')"
 
-async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def is_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE=None, bot=None) -> bool:
     """Check if user is an admin in the chat."""
     try:
-        chat_member = await context.bot.get_chat_member(chat_id, user_id)
-        return chat_member.status in ['administrator', 'creator']
+        if context and not bot:
+            bot = context.bot
+        chat_member = await context.bot.get_chat_member(chat_id, user_id=bot.id)
+        status = chat_member.status in ['administrator', 'creator']
+        logger.debug(f"Bot is Admin in chat {chat_id}: {status}")
+        return status
     except TelegramError:
         return False
 
-async def extract_urls(text: str) -> list:
+def extract_urls(text: str) -> list:
     """Extract URLs from text."""
     url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     return re.findall(url_pattern, text)
@@ -124,35 +208,31 @@ async def handle_chat_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Bot removed from {update.effective_chat.type}: {chat_info}")
             MONITORED_CHATS.discard(update.effective_chat.id)
 
-async def update_monitored_chats(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Update MONITORED_CHATS based on bot's status in the chat."""
-    logger.debug(f"Entering update_monitored_chats for chat_id: {chat_id}")
-    try:
-        # Get current monitoring status
-        was_monitored = chat_id in MONITORED_CHATS
-        bot = context.bot
-        bot_info = await bot.get_me()
-        # Check bot's status
-        member = await context.bot.get_chat_member(chat_id, user_id=bot_info.id)
-        logger.debug(f"Bot status in chat {chat_id}: {member.status}")
+# async def update_monitored_chats(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+#     """Update MONITORED_CHATS based on bot's status in the chat."""
+#     logger.debug(f"Entering update_monitored_chats for chat_id: {chat_id}")
+#     try:
+#         # Get current monitoring status
+#         was_monitored = chat_id in MONITORED_CHATS
+#         # Check bot's status
         
-        if member.status in ['administrator', 'member']:
-            MONITORED_CHATS.add(chat_id)
-            if not was_monitored:
-                logger.info(f"Started monitoring chat {chat_id} (status: {member.status})")
-            else:
-                logger.debug(f"Continuing to monitor chat {chat_id} (status: {member.status})")
-        else:
-            if was_monitored:
-                logger.info(f"Stopped monitoring chat {chat_id} (status: {member.status})")
-            MONITORED_CHATS.discard(chat_id)
-            logger.debug(f"Chat {chat_id} not monitored (status: {member.status})")
-    except TelegramError as e:
-        if chat_id in MONITORED_CHATS:
-            logger.info(f"Stopped monitoring chat {chat_id} due to error")
-        logger.warning(f"Could not verify status in chat {chat_id}: {e}")
-        MONITORED_CHATS.discard(chat_id)
-    logger.debug(f"Exiting update_monitored_chats. Total monitored chats: {len(MONITORED_CHATS)}")
+#         if is_admin(chat_id=chat_id, context=context):
+#             MONITORED_CHATS.add(chat_id)
+#             if not was_monitored:
+#                 logger.info(f"Started monitoring chat {chat_id}")
+#             else:
+#                 logger.debug(f"Continuing to monitor chat {chat_id}")
+#         else:
+#             if was_monitored:
+#                 logger.info(f"Stopped monitoring chat {chat_id}")
+#             MONITORED_CHATS.discard(chat_id)
+#             logger.debug(f"Chat {chat_id} not monitored")
+#     except TelegramError as e:
+#         if chat_id in MONITORED_CHATS:
+#             logger.info(f"Stopped monitoring chat {chat_id} due to error")
+#         logger.warning(f"Could not verify status in chat {chat_id}: {e}")
+#         MONITORED_CHATS.discard(chat_id)
+#     logger.debug(f"Exiting update_monitored_chats. Total monitored chats: {len(MONITORED_CHATS)}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in channels and groups."""
@@ -167,7 +247,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Update MONITORED_CHATS on every message
     logger.debug(f"Updating monitored chats status for {chat_info}")
-    await update_monitored_chats(update.effective_chat.id, context)
+    # await update_monitored_chats(update.effective_chat.id, context)
     urls = await extract_urls(message.text or message.caption or "")
 
     if urls:
@@ -196,96 +276,61 @@ async def check_all_links(context: ContextTypes.DEFAULT_TYPE):
     """Periodic task to check all links in channels and groups."""
     logger.info("Starting periodic link check")
     bot = context.bot
-    
-    async def check_chat_messages(chat_id):
-        try:
-            # Calculate the date threshold (7 days ago)
-            cutoff_date = datetime.now(timezone.utc) - timedelta(days=SCAN_MESSAGE_DAYS)
-            logger.debug(f"Scan for old messages in ChatID: {chat_id}")
-            try:
-                # Get chat information
-                chat = await context.bot.get_chat(chat_id)
-                
-                # Start with the most recent message
-                if chat.pinned_message:
-                    last_message_id = chat.pinned_message.message_id
-                else:
-                    # If no pinned message, try to get the latest message
-                    updates = await context.bot.get_updates(offset=-1, limit=1)
-                    if updates and (updates[0].channel_post or updates[0].message):
-                        last_message_id = (updates[0].channel_post or updates[0].message).message_id
-                    else:
-                        logger.warning(f"No messages found in chat {chat_id}")
-                        return
-
-                # Fetch last 100 messages
-                for i in range(last_message_id, max(1, last_message_id - 100), -1):
+    global ACTIVE_LINKS
+    for chat_id, messages in chat_messages.items():
+        logger.info(f"Checking messages in chat {chat_id}")
+        for message in messages:
+            #TODO: forbidden word list
+            if "nsfw" in message['message_text']:
+                try:
+                    context.bot.delete_message(chat_id=chat_id, message_id=message['message_id'])
+                    print(f"Deleted message {message['message_id']} from chat {chat_id}")
+                except Exception as e:
+                    print(f"Failed to delete message {message['message_id']} from chat {chat_id}: {e}")
+            elif False: #message.new_chat_members or message.left_chat_member:
+                #TODO: delete message also 
+                # try:
+                #     await message.delete()
+                #     logger.info(f"Removed join/leave message in chat {chat_id}")
+                # except TelegramError as e:
+                #     logger.error(f"Failed to delete join/leave message: {e}")
+                # continue
+                pass
+            
+            urls = extract_urls(message["message_text"])
+            for url in urls:
+                # First check domain compliance
+                if not await is_allowed_domain(url):
+                    logger.warning(f"Found unauthorized domain in URL: {url}")
                     try:
-                        message = await context.bot.forward_message(
-                            chat_id=chat_id,
-                            from_chat_id=chat_id,
-                            message_id=i,
-                            disable_notification=True
-                        )
-                        
-                        # Skip messages older than 7 days
-                        if message.date < cutoff_date:
-                            break
-                            
-                        # Check for join/leave messages
-                        if message.new_chat_members or message.left_chat_member:
-                            try:
-                                await message.delete()
-                                logger.info(f"Removed join/leave message in chat {chat_id}")
-                            except TelegramError as e:
-                                logger.error(f"Failed to delete join/leave message: {e}")
-                            continue
-                            
-                        # Check URLs in messages
-                        if message.text or message.caption:
-                            urls = await extract_urls(message.text or message.caption or "")
-                            for url in urls:
-                                # First check domain compliance
-                                if not await is_allowed_domain(url):
-                                    logger.warning(f"Found unauthorized domain in URL: {url}")
-                                    try:
-                                        await message.delete()
-                                        if message.from_user:
-                                            await warn_user(message.from_user.id, chat_id, context)
-                                    except TelegramError as e:
-                                        logger.error(f"Failed to delete message with unauthorized domain: {e}")
-                                    continue
-
-                                # Then check for errors
-                                is_valid, error_message = await check_url(url)
-                                if not is_valid:
-                                    logger.warning(f"Found error for URL: {url} - {error_message}")
-                                    try:
-                                        await message.delete()
-                                        await bot.send_message(
-                                            chat_id=chat_id,
-                                            text=f"🔍 Removed message with broken link ({error_message}): {url}"
-                                        )
-                                    except TelegramError as e:
-                                        logger.error(f"Failed to delete message with broken link: {e}")
-                                else:
-                                    # Store active link for summary
-                                    if chat_id not in ACTIVE_LINKS:
-                                        ACTIVE_LINKS[chat_id] = {}
-                                    ACTIVE_LINKS[chat_id][url] = message.text or message.caption or url
+                        context.bot.delete_message(chat_id=chat_id, message_id=message['message_id'])
+                        if message.user_id!="":
+                            await warn_user(message.user_id, chat_id, context)
                     except TelegramError as e:
-                        # Skip messages that can't be accessed
-                        continue
-            except TelegramError as e:
-                logger.error(f"Failed to get messages from chat {chat_id}: {e}")
-        except TelegramError as e:
-            logger.error(f"Error checking messages in chat {chat_id}: {e}")
+                        logger.error(f"Failed to delete message with unauthorized domain: {e}")
+                    continue
+                else:
+                    #allowed urls
+                    # Then check for errors
+                    is_valid, error_message = await check_url(url)
+                    if not is_valid:
+                        logger.warning(f"Found error for URL: {url} - {error_message}")
+                        try:
+                            await message.delete()
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🔍 Removed message with broken link ({error_message}): {url}"
+                            )
+                        except TelegramError as e:
+                            logger.error(f"Failed to delete message with broken link: {e}")
+                    else:
+                        logger.info(f"Found error URL: {url} - add to active links")
+                        # Store active link for summary
+                        if chat_id not in ACTIVE_LINKS:
+                            ACTIVE_LINKS[chat_id] = {}
+                        ACTIVE_LINKS[chat_id][url] = message.text or message.caption or url                
 
     try:
-        # Check all monitored chats
-        for chat_id in MONITORED_CHATS:
-            logger.info(f"Checking messages in chat {chat_id}")
-            await check_chat_messages(chat_id)
         # Create summary posts for each chat
         for chat_id, links in ACTIVE_LINKS.items():
             if links:
@@ -334,42 +379,46 @@ async def warn_user(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TY
 
 async def initialize_monitored_chats(application: Application):
     """Initialize MONITORED_CHATS with all channels and groups where bot is member/admin."""
-    try:
-        # Get bot information
-        bot = application.bot
-        bot_info = await bot.get_me()
-        logger.info(f"Initializing monitored chats for bot: {bot_info.username}")
+    # try:
+    # Get bot information
+    bot = application.bot
+    bot_info = await bot.get_me()
+    logger.info(f"Initializing monitored chats for bot")
 
-        
-        # Get all updates to find initial chats
-        updates = await bot.get_updates(offset=-1, timeout=1)
-        initial_chats = set()
-        for update in updates:
-            if update.effective_chat:
-                initial_chats.add(update.effective_chat.id)
+    #     # Get all updates to find initial chats
+    #     updates = await bot.get_updates(offset=-1, timeout=1)
+    #     initial_chats = set()
+    #     for update in updates:
+    #         if update.effective_chat:
+    #             initial_chats.add(update.effective_chat.id)
 
-        # Check bot's status in each chat
-        for chat_id in initial_chats:
-            try:
-                chat = await bot.get_chat(chat_id)
-                member = await bot.get_chat_member(chat_id)
-                if member.status in ['administrator', 'member']:
-                    MONITORED_CHATS.add(chat_id)
-                    logger.info(f"Added existing chat to monitoring: {get_chat_info(chat)}")
-            except TelegramError as e:
-                logger.warning(f"Could not verify status in chat {chat_id}: {e}")
+    #     # Check bot's status in each chat
+    #     for chat_id in initial_chats:
+    #         try:
+    #             chat = await bot.get_chat(chat_id)
+    #             if is_admin(chat_id=chat_id, context=None, bot=bot):
+    #                 MONITORED_CHATS.add(chat_id)
+    #                 logger.info(f"Added existing chat to monitoring: {get_chat_info(chat)}")
+    #         except TelegramError as e:
+    #             logger.warning(f"Could not verify status in chat {chat_id}: {e}")
 
-        logger.info(f"Initialized monitoring for {len(MONITORED_CHATS)} chats")
-    except Exception as e:
-        logger.error(f"Error initializing monitored chats: {e}")
+    #     logger.info(f"Initialized monitoring for {len(MONITORED_CHATS)} chats")
+    # except Exception as e:
+    #     logger.error(f"Error initializing monitored chats: {e}")
 
 def main():
     """Start the bot with proper async handling"""
     logger.info("Starting Chat Management Bot...")
     
+    # Load messages from disk
+    load_chat_messages_from_disk()
+
     # Create application
     application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     
+    # create local message store
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_store_handler))
+
     # Add handlers for both channels and groups
     application.add_handler(MessageHandler(
         (filters.ChatType.CHANNEL | filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & 
