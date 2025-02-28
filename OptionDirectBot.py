@@ -1,7 +1,10 @@
 import logging
 import os
 import asyncio
+import random
 from io import BytesIO
+from collections import deque
+from datetime import datetime
 import colorlog
 from dotenv import load_dotenv
 from telegram import Update, User, InlineKeyboardButton, InlineKeyboardMarkup
@@ -43,11 +46,16 @@ CHECK_CALLBACK = "check"
 LIKE_CALLBACK = "like"
 DISLIKE_CALLBACK = "dislike"
 
-# Store feedback counts
+# Store feedback counts and processing queue
 feedback_counts = {
     'likes': 0,
     'dislikes': 0
 }
+
+# Queue for processing requests
+processing_queue = deque()
+PROCESSING_TIME_MIN = 10
+PROCESSING_TIME_MAX = 50
 
 def get_user_info(user: User) -> str:
     """Get formatted user information for logging."""
@@ -206,6 +214,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             text="Sorry, there was an error processing your request. Please try again."
         )
 
+async def simulate_processing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status_message_id: int):
+    """Simulate processing time and manage queue."""
+    processing_time = random.randint(PROCESSING_TIME_MIN, PROCESSING_TIME_MAX)
+    await asyncio.sleep(processing_time)
+    return processing_time
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages and images based on current state."""
     if not is_private_chat(update):
@@ -217,17 +231,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_state == 'awaiting_create_prompt':
         prompt = update.message.text
         logger.info(f"Received create prompt from {user_info}: {prompt}")
-        feedback_keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("👍 Like it", callback_data=LIKE_CALLBACK),
-                InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
-            ]
-        ])
-        await context.bot.send_message(
+        
+        # Add request to queue and get position
+        queue_position = len(processing_queue)
+        estimated_wait = queue_position * PROCESSING_TIME_MAX
+        
+        # Send initial status message
+        status_message = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"Creating content with prompt: {prompt}\n(Functionality to be implemented)",
-            reply_markup=feedback_keyboard
+            text=f"⏳ Your request is in queue...\nPosition: {queue_position + 1}\nEstimated wait time: up to {estimated_wait} seconds"
         )
+        
+        # Add to processing queue
+        processing_queue.append((update.effective_chat.id, status_message.message_id))
+        
+        # If this is the first request, process it immediately
+        if queue_position == 0:
+            processing_time = await simulate_processing(context, update.effective_chat.id, status_message.message_id)
+            
+            # Delete status message
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id
+            )
+            
+            # Send completion message with feedback keyboard
+            feedback_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("👍 Like it", callback_data=LIKE_CALLBACK),
+                    InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
+                ]
+            ])
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ Content created with prompt: {prompt}\nProcessing took {processing_time} seconds",
+                reply_markup=feedback_keyboard
+            )
+            
+            # Process next in queue if any
+            processing_queue.popleft()
+            if processing_queue:
+                next_chat_id, next_message_id = processing_queue[0]
+                asyncio.create_task(simulate_processing(context, next_chat_id, next_message_id))
+        
         context.user_data['state'] = None
         
     elif current_state == 'awaiting_modify_image':
@@ -249,17 +295,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt = update.message.text
         image_file_id = context.user_data.get('image_file_id')
         logger.info(f"Received modify prompt from {user_info}: {prompt}")
-        feedback_keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("👍 Like it", callback_data=LIKE_CALLBACK),
-                InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
-            ]
-        ])
-        await context.bot.send_message(
+        
+        # Add request to queue and get position
+        queue_position = len(processing_queue)
+        estimated_wait = queue_position * PROCESSING_TIME_MAX
+        
+        # Send initial status message
+        status_message = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"Modifying image with prompt: {prompt}\n(Functionality to be implemented)",
-            reply_markup=feedback_keyboard
+            text=f"⏳ Your image modification is in queue...\nPosition: {queue_position + 1}\nEstimated wait time: up to {estimated_wait} seconds"
         )
+        
+        # Add to processing queue
+        processing_queue.append((update.effective_chat.id, status_message.message_id))
+        
+        # If this is the first request, process it immediately
+        if queue_position == 0:
+            processing_time = await simulate_processing(context, update.effective_chat.id, status_message.message_id)
+            
+            # Delete status message
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id
+            )
+            
+            # Send completion message with feedback keyboard
+            feedback_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("👍 Like it", callback_data=LIKE_CALLBACK),
+                    InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
+                ]
+            ])
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ Image modified with prompt: {prompt}\nProcessing took {processing_time} seconds",
+                reply_markup=feedback_keyboard
+            )
+            
+            # Process next in queue if any
+            processing_queue.popleft()
+            if processing_queue:
+                next_chat_id, next_message_id = processing_queue[0]
+                asyncio.create_task(simulate_processing(context, next_chat_id, next_message_id))
+        
         context.user_data['state'] = None
         context.user_data['image_file_id'] = None
         
