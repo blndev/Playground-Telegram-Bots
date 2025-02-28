@@ -40,6 +40,14 @@ CREATE_CALLBACK = "create"
 MODIFY_CALLBACK = "modify"
 OPTIMIZE_CALLBACK = "optimize"
 CHECK_CALLBACK = "check"
+LIKE_CALLBACK = "like"
+DISLIKE_CALLBACK = "dislike"
+
+# Store feedback counts
+feedback_counts = {
+    'likes': 0,
+    'dislikes': 0
+}
 
 def get_user_info(user: User) -> str:
     """Get formatted user information for logging."""
@@ -147,6 +155,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info(f"Menu selection from {user_info}: {query.data}")
     
     try:
+        if query.data == LIKE_CALLBACK:
+            feedback_counts['likes'] += 1
+            await query.edit_message_reply_markup(None)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="👍 Thank you for your feedback!"
+            )
+            return
+            
+        elif query.data == DISLIKE_CALLBACK:
+            feedback_counts['dislikes'] += 1
+            await query.edit_message_reply_markup(None)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="👎 Thank you for your feedback. We'll try to improve!"
+            )
+            return
+            
         if query.data == CREATE_CALLBACK:
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
@@ -191,9 +217,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_state == 'awaiting_create_prompt':
         prompt = update.message.text
         logger.info(f"Received create prompt from {user_info}: {prompt}")
+        feedback_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👍 Like it", callback_data=LIKE_CALLBACK),
+                InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
+            ]
+        ])
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"Creating content with prompt: {prompt}\n(Functionality to be implemented)"
+            text=f"Creating content with prompt: {prompt}\n(Functionality to be implemented)",
+            reply_markup=feedback_keyboard
         )
         context.user_data['state'] = None
         
@@ -216,9 +249,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt = update.message.text
         image_file_id = context.user_data.get('image_file_id')
         logger.info(f"Received modify prompt from {user_info}: {prompt}")
+        feedback_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👍 Like it", callback_data=LIKE_CALLBACK),
+                InlineKeyboardButton("👎 Dislike", callback_data=DISLIKE_CALLBACK)
+            ]
+        ])
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"Modifying image with prompt: {prompt}\n(Functionality to be implemented)"
+            text=f"Modifying image with prompt: {prompt}\n(Functionality to be implemented)",
+            reply_markup=feedback_keyboard
         )
         context.user_data['state'] = None
         context.user_data['image_file_id'] = None
