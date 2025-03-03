@@ -228,6 +228,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_info = get_user_info(update.effective_user)
     current_state = context.user_data.get('state', None)
     
+    # Check if this is a message received while offline
+    message_time = update.message.date
+    current_time = datetime.now(message_time.tzinfo)
+    time_difference = (current_time - message_time).total_seconds()
+    
+    # If message is older than 60 seconds, it was received while offline
+    if time_difference > 60:
+        if update.message.photo:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="I was offline and I'm back for work. Should I proceed with your last image?"
+            )
+            return
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="I was offline but I'm back online now. Please use /start to continue."
+            )
+            return
+    
     if current_state == 'awaiting_create_prompt':
         prompt = update.message.text
         logger.info(f"Received create prompt from {user_info}: {prompt}")
@@ -368,7 +388,7 @@ def main():
     ))
     
     logger.info("Bot is ready and listening for messages")
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling()  # Remove drop_pending_updates to receive offline messages
 
 if __name__ == '__main__':
     main()
